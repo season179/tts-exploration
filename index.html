@@ -46,6 +46,12 @@
       <option value="chinese">Chinese (Serena)</option>
     </select>
   </label>
+  <label>Format
+    <select id="format">
+      <option value="m4a" selected>M4A</option>
+      <option value="wav">WAV</option>
+    </select>
+  </label>
   <span class="charcount"><span id="count">0</span> / 10000</span>
 </div>
 
@@ -53,8 +59,7 @@
   <summary>Narration style</summary>
   <div class="row">
     <input type="text" id="instruction" maxlength="500"
-           value="Calm, clear audiobook narration. Natural pacing, restrained emotion, precise pronunciation, and comfortable pauses between paragraphs."
-           placeholder="Optional narration instruction">
+           placeholder="Optional, e.g. “Calm, clear audiobook narration.” — can cause overlong output on short or Chinese text">
   </div>
 </details>
 
@@ -67,20 +72,43 @@
 
 <div id="result">
   <audio id="player" controls aria-label="Generated audio"></audio>
-  <p id="downloadRow" style="display:none"><a id="download" download>Download WAV</a></p>
+  <p id="downloadRow" style="display:none"><a id="download">Download</a></p>
 </div>
 
 <script>
+// The access token rides in the URL fragment (never sent to the server, not
+// baked into this page — / is served unauthenticated). Get the full URL from
+// `tts daemon status`.
+const TOKEN = decodeURIComponent(location.hash.slice(1));
 const $ = id => document.getElementById(id);
 let pollTimer = null;
+let blobUrl = null;
+
+const api = (path, opts = {}) => fetch(path, {
+  ...opts,
+  headers: {
+    "Authorization": `Bearer ${TOKEN}`,
+    ...(opts.body ? { "Content-Type": "application/json" } : {}),
+    ...(opts.headers || {}),
+  },
+});
+
+const errMsg = (data, res) =>
+  (data && data.error && data.error.message) || res.statusText;
 
 $("text").addEventListener("input", () => { $("count").textContent = $("text").value.length; });
+
+if (!TOKEN) {
+  setStatus("Missing access token — open this page via the URL printed by “tts daemon status”.", true);
+  $("generate").disabled = true;
+}
 
 $("generate").addEventListener("click", async () => {
   const text = $("text").value.trim();
   if (!text) { setStatus("Enter some text first.", true); return; }
 
   clearInterval(pollTimer);
+  if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
   $("player").removeAttribute("src");
   $("player").load();
   $("downloadRow").style.display = "none";
@@ -89,17 +117,17 @@ $("generate").addEventListener("click", async () => {
   setStatus("Submitting…");
 
   try {
-    const res = await fetch("/speak", {
+    const res = await api("/v1/jobs", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
         language: $("language").value,
+        format: $("format").value,
         instruction: $("instruction").value.trim(),
       }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || res.statusText);
+    if (!res.ok) throw new Error(errMsg(data, res));
     poll(data.id);
   } catch (err) {
     setStatus("Error: " + err.message, true);
@@ -110,9 +138,9 @@ $("generate").addEventListener("click", async () => {
 function poll(id) {
   pollTimer = setInterval(async () => {
     try {
-      const res = await fetch(`/status/${id}`);
+      const res = await api(`/v1/jobs/${id}`);
       const s = await res.json();
-      if (!res.ok) throw new Error(s.error || res.statusText);
+      if (!res.ok) throw new Error(errMsg(s, res));
 
       if (s.status === "queued") {
         setStatus(`Queued (position ${s.queue_position + 1})…`);
@@ -130,14 +158,13 @@ function poll(id) {
         clearInterval(pollTimer);
         $("bar").style.display = "none";
         setStatus(`Done — ${s.duration_sec}s of audio (${s.voice}) generated in ${s.generation_sec}s.`);
-        $("player").src = s.audio_url;
-        $("download").href = s.audio_url;
-        $("downloadRow").style.display = "";
+        await showAudio(s);
         $("generate").disabled = false;
-      } else if (s.status === "error") {
+      } else if (s.status === "failed" || s.status === "canceled") {
         clearInterval(pollTimer);
         $("bar").style.display = "none";
-        setStatus("Generation failed: " + (s.error || "unknown error"), true);
+        const msg = (s.error && s.error.message) || s.status;
+        setStatus("Generation failed: " + msg, true);
         $("generate").disabled = false;
       }
     } catch (err) {
@@ -146,6 +173,19 @@ function poll(id) {
       $("generate").disabled = false;
     }
   }, 700);
+}
+
+async function showAudio(s) {
+  const res = await api(s.audio_url);
+  if (!res.ok) throw new Error("audio fetch failed: " + res.statusText);
+  const blob = await res.blob();
+  blobUrl = URL.createObjectURL(blob);
+  $("player").src = blobUrl;
+  const name = `tts-${s.id.slice(0, 8)}.${s.format}`;
+  $("download").href = blobUrl;
+  $("download").download = name;
+  $("download").textContent = `Download ${s.format.toUpperCase()}`;
+  $("downloadRow").style.display = "";
 }
 
 function setStatus(msg, isError = false) {
