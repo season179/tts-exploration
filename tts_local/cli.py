@@ -522,6 +522,64 @@ def cmd_setup(args) -> int:
     return EXIT_OK
 
 
+AGENTS_DOC = """\
+# tts — local text-to-speech CLI (for scripts and AI agents)
+
+Offline Qwen3-TTS on Apple Silicon. Two voices: Aiden (English), Serena
+(Chinese); language is auto-detected. Output: M4A (default) or WAV
+(24 kHz mono). A resident daemon holds the model; the CLI auto-starts it
+(first start ~1 min to load the model, later calls take seconds).
+
+## Synchronous (most common)
+
+    tts speak "text to say" -o out.m4a --json
+    echo "text" | tts speak -o out.m4a --json      # stdin
+    tts speak "text" -o - > out.m4a                # binary audio to stdout
+
+Options: --instruction "Whisper urgently." (narration style, max 500 chars),
+--language auto|english|chinese, --format m4a|wav, --timeout SECONDS,
+--force (overwrite), --quiet, --no-start (fail instead of starting daemon).
+Max 10,000 chars per request; long text is chunked automatically.
+
+## Async (long texts, parallel work)
+
+    id=$(tts submit "long text ...")
+    tts status "$id" --json          # queued | running | done | failed | canceled
+    tts wait "$id" -o out.m4a --json
+    tts cancel "$id" --json
+
+## Introspection / lifecycle
+
+    tts health --json                # daemon state without starting it
+    tts voices --json                # voices, languages, formats, limits
+    tts daemon status|start|stop|logs
+    tts setup                        # one-time: hardware check + ~3.5 GB model download
+
+## Contract
+
+- --json: exactly one JSON object on stdout; progress and logs on stderr.
+  Success objects have "ok": true; errors {"ok": false, "error": {code, message}}.
+- Exit codes: 0 ok · 2 usage · 3 daemon unavailable (incl. model not
+  downloaded — run `tts setup`) · 4 timeout · 5 busy queue · 6 synthesis
+  failed/canceled · 7 output I/O · 130 interrupted.
+- Direct HTTP API: read ~/.local/state/qwen-tts/daemon.json (0600) for
+  {port, token}; bearer-auth /v1 endpoints (health, jobs, voices). Never
+  hard-code port 8765.
+
+## Caveats
+
+- A style --instruction on very short text can rarely produce overlong
+  audio; a built-in guard caps it (~0.6 s/char, min 10 s).
+- One instruction applies to the whole request; split text needing
+  different styles into separate calls.
+"""
+
+
+def cmd_agents(args) -> int:
+    print(AGENTS_DOC, end="")
+    return EXIT_OK
+
+
 def cmd_daemon_logs(args) -> int:
     if not LOG_PATH.exists():
         log_err(f"no log file at {LOG_PATH}")
@@ -566,6 +624,14 @@ examples:
 speak/submit options (see `tts speak --help` for all):
   --instruction TEXT   narration style, e.g. "Whisper urgently." (max 500 chars)
   --language X         auto | english | chinese        --format X   m4a | wav
+
+for scripts and agents:
+  - run `tts agents` for the full machine-oriented usage guide
+  - --json prints exactly one JSON object on stdout; progress/logs go to stderr
+  - the daemon auto-starts on first use (~1 min model load; later calls take
+    seconds and the daemon stays resident)
+  - one-time setup on a new machine: `tts setup` (checks hardware, downloads
+    the ~3.5 GB model); until then commands exit 3 with a message saying so
 """
 
 
@@ -610,6 +676,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("job_id")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_cancel)
+
+    p = sub.add_parser("agents", help="print the usage guide for scripts and AI agents")
+    p.set_defaults(func=cmd_agents)
 
     p = sub.add_parser("setup", help="check machine compatibility and download "
                                      "the model (idempotent)")
