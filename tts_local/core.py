@@ -9,6 +9,7 @@ import subprocess
 import wave
 from pathlib import Path
 
+import mlx.core as mx
 import numpy as np
 import re
 
@@ -35,6 +36,11 @@ M4A_BITRATE = 64000  # AAC, plenty for 24 kHz mono speech
 CODEC_TOKENS_PER_SEC = 12.5  # 4096 tokens == 327.68 s
 CAP_SEC_PER_CHAR = 0.6
 CAP_SEC_FLOOR = 10.0
+# Watchdog silence threshold. Measured on real output: quietest genuine-speech
+# 2s chunk (soft instructed delivery) is -31 dB RMS; runaway junk is -70 dB but
+# can include low-level noise, so -60 dB missed some trajectories. -40 dB keeps
+# a 3x amplitude margin below real speech.
+SILENCE_RMS = 1e-2
 
 VOICES = {"english": "Aiden", "chinese": "Serena"}
 FORMATS = ("m4a", "wav")
@@ -188,6 +194,65 @@ class Engine:
         para_pause = np.zeros(int(SAMPLE_RATE * PARAGRAPH_PAUSE_MS / 1000), dtype=np.float32)
         chunk_pause = np.zeros(int(SAMPLE_RATE * CHUNK_PAUSE_MS / 1000), dtype=np.float32)
 
+        retry_counter = 0
+
+        def generate_attempt(
+            attempt_text: str, attempt_instruction: str | None, cap_sec: float,
+            reseed: bool = False,
+        ) -> tuple[np.ndarray, str | None]:
+            nonlocal retry_counter
+            if reseed:
+                retry_counter += 1
+                mx.random.seed(retry_counter)
+                log.warning("reseeded retry with seed %d", retry_counter)
+
+            audio_parts: list[np.ndarray] = []
+            speech_seen = False
+            silent_chunks = 0
+            for r in self.model.generate_custom_voice(
+                text=attempt_text,
+                speaker=speaker,
+                language=language,
+                instruct=attempt_instruction,
+                max_tokens=int(cap_sec * CODEC_TOKENS_PER_SEC),
+                stream=True,
+                streaming_interval=2.0,
+            ):
+                if cancel and cancel():
+                    raise JobCancelled()
+                part = np.asarray(r.audio, dtype=np.float32)
+                audio_parts.append(part)
+                rms = float(np.sqrt(np.mean(part * part))) if part.size else 0.0
+                if rms >= SILENCE_RMS:
+                    speech_seen = True
+                    silent_chunks = 0
+                elif speech_seen:
+                    silent_chunks += 1
+                    if silent_chunks == 3:
+                        trailing_sec = sum(
+                            len(p) for p in audio_parts[-silent_chunks:]
+                        ) / SAMPLE_RATE
+                        total_sec = sum(len(p) for p in audio_parts) / SAMPLE_RATE
+                        del audio_parts[-silent_chunks:]
+                        log.warning(
+                            "silence watchdog detected runaway at %.1fs after %.1fs "
+                            "of trailing silence for %d-char text %r",
+                            total_sec, trailing_sec, len(attempt_text), attempt_text[:40],
+                        )
+                        return np.concatenate(audio_parts), "silence watchdog"
+
+            if not audio_parts:
+                log.warning("generation produced no audio for text %r", attempt_text[:40])
+                return np.zeros(0, dtype=np.float32), "empty output"
+            audio = np.concatenate(audio_parts)
+            if len(audio) >= (cap_sec - 1.0) * SAMPLE_RATE:
+                log.warning(
+                    "runaway generation capped at %.1fs for %d-char text %r",
+                    len(audio) / SAMPLE_RATE, len(attempt_text), attempt_text[:40],
+                )
+                return audio, "token cap"
+            return audio, None
+
         segments: list[np.ndarray] = []
         done = 0
         for p_idx, chunks in enumerate(paragraphs):
@@ -199,79 +264,53 @@ class Engine:
                 if c_idx > 0:
                     segments.append(chunk_pause)
                 cap_sec = max(CAP_SEC_FLOOR, len(chunk) * CAP_SEC_PER_CHAR)
-                audio_parts = []
-                for r in self.model.generate_custom_voice(
-                    text=chunk,
-                    speaker=speaker,
-                    language=language,
-                    instruct=instruction or None,
-                    max_tokens=int(cap_sec * CODEC_TOKENS_PER_SEC),
-                ):
-                    if cancel and cancel():
-                        raise JobCancelled()
-                    audio_parts.append(np.asarray(r.audio, dtype=np.float32))
-                chunk_audio = np.concatenate(audio_parts)
-                if len(chunk_audio) >= (cap_sec - 1.0) * SAMPLE_RATE:
+                chunk_audio, runaway = generate_attempt(
+                    chunk, instruction or None, cap_sec
+                )
+                if runaway:
                     log.warning(
-                        "runaway generation capped at %.1fs for %d-char chunk %r",
-                        len(chunk_audio) / SAMPLE_RATE, len(chunk), chunk[:40],
+                        "%s triggered; retrying same chunk with instruction and new seed",
+                        runaway,
                     )
-                    if instruction:
-                        # Instructions are the most common runaway trigger; the
-                        # same text usually completes without one.
-                        log.warning("retrying chunk without instruction")
-                        audio_parts = []
-                        for r in self.model.generate_custom_voice(
-                            text=chunk,
-                            speaker=speaker,
-                            language=language,
-                            instruct=None,
-                            max_tokens=int(cap_sec * CODEC_TOKENS_PER_SEC),
-                        ):
-                            if cancel and cancel():
-                                raise JobCancelled()
-                            audio_parts.append(np.asarray(r.audio, dtype=np.float32))
-                        chunk_audio = np.concatenate(audio_parts)
-                    if len(chunk_audio) >= (cap_sec - 1.0) * SAMPLE_RATE:
-                        sentences = split_sentences(chunk)
-                        log.warning(
-                            "still capped at %.1fs; splitting chunk into %d sentences",
-                            len(chunk_audio) / SAMPLE_RATE, len(sentences),
+                    chunk_audio, runaway = generate_attempt(
+                        chunk, instruction or None, cap_sec, reseed=True
+                    )
+                if runaway:
+                    log.warning(
+                        "reseeded instruction retry also hit %s; "
+                        "retrying without instruction",
+                        runaway,
+                    )
+                    chunk_audio, runaway = generate_attempt(
+                        chunk, None, cap_sec, reseed=True
+                    )
+                if runaway:
+                    sentences = split_sentences(chunk)
+                    log.warning(
+                        "retry without instruction also hit %s; "
+                        "splitting chunk into %d sentences",
+                        runaway, len(sentences),
+                    )
+                    sentence_segments: list[np.ndarray] = []
+                    for s_idx, sentence in enumerate(sentences):
+                        if cancel and cancel():
+                            raise JobCancelled()
+                        if s_idx > 0:
+                            sentence_segments.append(chunk_pause)
+                        sentence_cap_sec = max(
+                            CAP_SEC_FLOOR, len(sentence) * CAP_SEC_PER_CHAR
                         )
-                        sentence_segments: list[np.ndarray] = []
-                        for s_idx, sentence in enumerate(sentences):
-                            if cancel and cancel():
-                                raise JobCancelled()
-                            if s_idx > 0:
-                                sentence_segments.append(chunk_pause)
-                            sentence_cap_sec = max(
-                                CAP_SEC_FLOOR, len(sentence) * CAP_SEC_PER_CHAR
+                        sentence_audio, sentence_runaway = generate_attempt(
+                            sentence, None, sentence_cap_sec, reseed=True
+                        )
+                        if sentence_runaway:
+                            log.warning(
+                                "sentence fallback hit %s for %d-char sentence %r; "
+                                "keeping audio",
+                                sentence_runaway, len(sentence), sentence[:40],
                             )
-                            sentence_audio_parts = []
-                            for r in self.model.generate_custom_voice(
-                                text=sentence,
-                                speaker=speaker,
-                                language=language,
-                                instruct=None,
-                                max_tokens=int(sentence_cap_sec * CODEC_TOKENS_PER_SEC),
-                            ):
-                                if cancel and cancel():
-                                    raise JobCancelled()
-                                sentence_audio_parts.append(
-                                    np.asarray(r.audio, dtype=np.float32)
-                                )
-                            sentence_audio = np.concatenate(sentence_audio_parts)
-                            if len(sentence_audio) >= (
-                                sentence_cap_sec - 1.0
-                            ) * SAMPLE_RATE:
-                                log.warning(
-                                    "sentence fallback capped at %.1fs for %d-char "
-                                    "sentence %r; keeping capped audio",
-                                    len(sentence_audio) / SAMPLE_RATE,
-                                    len(sentence), sentence[:40],
-                                )
-                            sentence_segments.append(sentence_audio)
-                        chunk_audio = np.concatenate(sentence_segments)
+                        sentence_segments.append(sentence_audio)
+                    chunk_audio = np.concatenate(sentence_segments)
                 segments.append(chunk_audio)
                 done += 1
                 if progress:
