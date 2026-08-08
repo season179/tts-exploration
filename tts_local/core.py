@@ -216,6 +216,62 @@ class Engine:
                         "runaway generation capped at %.1fs for %d-char chunk %r",
                         len(chunk_audio) / SAMPLE_RATE, len(chunk), chunk[:40],
                     )
+                    if instruction:
+                        # Instructions are the most common runaway trigger; the
+                        # same text usually completes without one.
+                        log.warning("retrying chunk without instruction")
+                        audio_parts = []
+                        for r in self.model.generate_custom_voice(
+                            text=chunk,
+                            speaker=speaker,
+                            language=language,
+                            instruct=None,
+                            max_tokens=int(cap_sec * CODEC_TOKENS_PER_SEC),
+                        ):
+                            if cancel and cancel():
+                                raise JobCancelled()
+                            audio_parts.append(np.asarray(r.audio, dtype=np.float32))
+                        chunk_audio = np.concatenate(audio_parts)
+                    if len(chunk_audio) >= (cap_sec - 1.0) * SAMPLE_RATE:
+                        sentences = split_sentences(chunk)
+                        log.warning(
+                            "still capped at %.1fs; splitting chunk into %d sentences",
+                            len(chunk_audio) / SAMPLE_RATE, len(sentences),
+                        )
+                        sentence_segments: list[np.ndarray] = []
+                        for s_idx, sentence in enumerate(sentences):
+                            if cancel and cancel():
+                                raise JobCancelled()
+                            if s_idx > 0:
+                                sentence_segments.append(chunk_pause)
+                            sentence_cap_sec = max(
+                                CAP_SEC_FLOOR, len(sentence) * CAP_SEC_PER_CHAR
+                            )
+                            sentence_audio_parts = []
+                            for r in self.model.generate_custom_voice(
+                                text=sentence,
+                                speaker=speaker,
+                                language=language,
+                                instruct=None,
+                                max_tokens=int(sentence_cap_sec * CODEC_TOKENS_PER_SEC),
+                            ):
+                                if cancel and cancel():
+                                    raise JobCancelled()
+                                sentence_audio_parts.append(
+                                    np.asarray(r.audio, dtype=np.float32)
+                                )
+                            sentence_audio = np.concatenate(sentence_audio_parts)
+                            if len(sentence_audio) >= (
+                                sentence_cap_sec - 1.0
+                            ) * SAMPLE_RATE:
+                                log.warning(
+                                    "sentence fallback capped at %.1fs for %d-char "
+                                    "sentence %r; keeping capped audio",
+                                    len(sentence_audio) / SAMPLE_RATE,
+                                    len(sentence), sentence[:40],
+                                )
+                            sentence_segments.append(sentence_audio)
+                        chunk_audio = np.concatenate(sentence_segments)
                 segments.append(chunk_audio)
                 done += 1
                 if progress:
