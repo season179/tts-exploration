@@ -552,8 +552,25 @@ def add_daemon_opts(p: argparse.ArgumentParser) -> None:
                    help="allow the daemon to download the model (~3.5 GB) if missing")
 
 
+EXAMPLES = """\
+examples:
+  tts speak "hello there" -o hello.m4a
+  echo "piped text" | tts speak -o out.m4a
+  tts speak "Once upon a time, a little fox lost his way." \\
+      --instruction "Warm, gentle bedtime-story narration." -o story.m4a
+  tts speak "你好，很高兴认识你。" --format wav -o zh.wav
+  tts speak "hi" --json                      # machine-readable result
+  id=$(tts submit "long text ..."); tts wait "$id" -o long.m4a
+  tts daemon status                          # daemon state + web UI URL
+
+speak/submit options (see `tts speak --help` for all):
+  --instruction TEXT   narration style, e.g. "Whisper urgently." (max 500 chars)
+  --language X         auto | english | chinese        --format X   m4a | wav
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="tts", description=__doc__,
+    parser = argparse.ArgumentParser(prog="tts", description=__doc__, epilog=EXAMPLES,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
