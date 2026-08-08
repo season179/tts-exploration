@@ -4,26 +4,33 @@ Local-only text-to-speech for Apple Silicon, callable by other applications
 and AI agents. Uses `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16` via
 `mlx-audio`. Voices: **Aiden** (English), **Serena** (Chinese).
 
-Three parts:
+One installable package (`tts_local/`), three parts:
 
-- **`tts`** — stdlib-only CLI client (any Python ≥3.9, no venv needed)
-- **`tts_daemon.py`** — resident inference daemon (HTTP API on loopback)
-- **`tts_core.py`** — synthesis engine (model, chunking, encoding)
+- **`cli.py`** — the `tts` command (thin client, fast startup)
+- **`daemon.py`** — resident inference daemon (HTTP API on loopback)
+- **`core.py`** — synthesis engine (model, chunking, encoding)
 
-The model (~3.5 GB) loads once into the daemon (~1 min) and stays resident;
-every call after that is pure inference time.
+The model (~3.5 GB) loads once into the daemon and stays resident; every
+call after that is pure inference time.
 
-## Setup
+## Install
 
 ```bash
-python3.14 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+curl -fsSL https://raw.githubusercontent.com/season179/tts-exploration/main/install.sh | sh
+tts setup   # one-time: compatibility check + ~3.5 GB model download
 ```
 
-Optionally symlink the CLI onto your PATH:
+The installer needs git (Xcode Command Line Tools) and installs
+[uv](https://docs.astral.sh/uv/) if missing, then `uv tool install`s this
+repo. `tts setup` is idempotent — safe to re-run any time. The daemon never
+downloads the model on its own: without setup you get a clear error and the
+suggestion to run it (agents can pass `--auto-download` to opt in instead).
+
+From a checkout (development):
 
 ```bash
-ln -s "$PWD/tts" ~/.local/bin/tts
+uv tool install --force .          # install your working copy as `tts`
+uv run tts daemon start --foreground   # or run the daemon in this terminal
 ```
 
 ## CLI usage
@@ -101,8 +108,9 @@ and their audio expire after 1 hour. Jobs do not survive a daemon restart.
   chars; language `auto` picks Serena when the text is ≥30% CJK, else Aiden.
 - No style instruction is applied by default. Instructions are a known model
   quirk: on short or Chinese text they can trigger runaway generation (the
-  model runs to its ~5.5 min length cap instead of stopping). Use
-  `--instruction` deliberately, mainly for longer English narration.
+  model fails to stop speaking). A per-chunk guard caps the damage at
+  0.6 s per character (10 s minimum) and logs a warning when it fires, so a
+  runaway costs seconds, not minutes.
 - One job synthesizes at a time (single MLX worker); others queue.
 - The daemon binds its port immediately and reports `loading` until the model
   is ready, so callers can distinguish "starting" from "absent".

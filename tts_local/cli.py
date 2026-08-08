@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """tts — CLI client for the local Qwen3-TTS daemon.
 
-Stdlib-only. Talks to tts_daemon.py over loopback HTTP using the discovery
-file in the state dir; auto-starts the daemon when needed.
+Talks to the daemon (tts_local.daemon) over loopback HTTP using the
+discovery file in the state dir; auto-starts the daemon when needed.
+Heavy imports stay lazy: every command except `setup` is stdlib-only.
 
 Exit codes:
   0 success            4 timed out           7 output I/O error
@@ -26,7 +27,6 @@ PROTOCOL_VERSION = 1
 STATE_DIR = Path(os.environ.get("TTS_STATE_DIR", "~/.local/state/qwen-tts")).expanduser()
 DISCOVERY_PATH = STATE_DIR / "daemon.json"
 LOG_PATH = STATE_DIR / "daemon.log"
-APP_DIR = Path(__file__).resolve().parent
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -120,29 +120,33 @@ def probe(d: dict, timeout: float = 3) -> dict | None:
 
 
 def daemon_python() -> str:
-    override = os.environ.get("TTS_DAEMON_PYTHON")
-    if override:
-        return override
-    venv = APP_DIR / ".venv" / "bin" / "python"
-    return str(venv) if venv.exists() else sys.executable
+    # The daemon lives in the same installed environment as this CLI.
+    return os.environ.get("TTS_DAEMON_PYTHON", sys.executable)
 
 
-def spawn_daemon() -> None:
+def daemon_argv() -> list[str]:
+    return [daemon_python(), "-m", "tts_local.daemon"]
+
+
+def spawn_daemon(auto_download: bool = False) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(STATE_DIR, 0o700)
+    env = dict(os.environ)
+    if auto_download:
+        env["TTS_AUTO_DOWNLOAD"] = "1"
     with open(LOG_PATH, "ab") as logf:
         subprocess.Popen(
-            [daemon_python(), str(APP_DIR / "tts_daemon.py")],
+            daemon_argv(),
             stdin=subprocess.DEVNULL,
             stdout=logf,
             stderr=logf,
             start_new_session=True,
-            cwd=APP_DIR,
+            env=env,
         )
 
 
 def connect(no_start: bool = False, start_timeout: float = 180,
-            need_ready: bool = True) -> tuple[dict, dict]:
+            need_ready: bool = True, auto_download: bool = False) -> tuple[dict, dict]:
     """Return (discovery, health) for a usable daemon, starting one if allowed."""
     d = read_discovery()
     health = probe(d) if d else None
@@ -154,7 +158,7 @@ def connect(no_start: bool = False, start_timeout: float = 180,
             raise CliError(EXIT_UNAVAILABLE, "daemon not running (--no-start given)",
                            "daemon_unavailable")
         log_err("starting tts daemon (first call loads the model, ~1 min) ...")
-        spawn_daemon()
+        spawn_daemon(auto_download=auto_download)
 
     deadline = time.monotonic() + start_timeout
     while time.monotonic() < deadline:
@@ -275,10 +279,18 @@ def submit_job(args, d: dict) -> dict:
     return request(d, "POST", "/v1/jobs", body=body)
 
 
+def effective_start_timeout(args) -> float:
+    if args.start_timeout is not None:
+        return args.start_timeout
+    # A first-time model download rides on this deadline; give it real time.
+    return 1800 if getattr(args, "auto_download", False) else 180
+
+
 def cmd_speak(args) -> int:
     if args.output == "-" and args.json:
         raise CliError(EXIT_USAGE, "-o - and --json both claim stdout; pick one", "usage")
-    d, _ = connect(args.no_start, args.start_timeout)
+    d, _ = connect(args.no_start, effective_start_timeout(args),
+                   auto_download=args.auto_download)
     accepted = submit_job(args, d)
     job_id = accepted["id"]
     show_progress = sys.stderr.isatty() and not args.quiet
@@ -296,7 +308,8 @@ def cmd_speak(args) -> int:
 
 
 def cmd_submit(args) -> int:
-    d, _ = connect(args.no_start, args.start_timeout)
+    d, _ = connect(args.no_start, effective_start_timeout(args),
+                   auto_download=args.auto_download)
     accepted = submit_job(args, d)
     emit(args, {"ok": True, **accepted}, human=accepted["id"])
     return EXIT_OK
@@ -351,14 +364,18 @@ def cmd_daemon_start(args) -> int:
     if args.foreground:
         if args.json:
             raise CliError(EXIT_USAGE, "--foreground and --json cannot be combined", "usage")
-        os.execv(daemon_python(), [daemon_python(), str(APP_DIR / "tts_daemon.py")])
+        if args.auto_download:
+            os.environ["TTS_AUTO_DOWNLOAD"] = "1"
+        argv = daemon_argv()
+        os.execvp(argv[0], argv)
     d = read_discovery()
     health = probe(d) if d else None
     already = bool(health and health["status"] == "ready")
     if not already:
         # Not running, still loading, or failed: connect() spawns only if
         # unreachable, then waits for ready (raising on a failed model load).
-        d, health = connect(no_start=False, start_timeout=args.start_timeout)
+        d, health = connect(no_start=False, start_timeout=effective_start_timeout(args),
+                            auto_download=args.auto_download)
     url = f"http://127.0.0.1:{d['port']}/#{d['token']}"
     emit(args, {"ok": True, "already_running": already,
                 "pid": health["pid"], "port": d["port"], "ui_url": url},
@@ -405,6 +422,106 @@ def cmd_daemon_status(args) -> int:
     return EXIT_OK
 
 
+def cmd_setup(args) -> int:
+    """Check machine compatibility, then download the model if missing."""
+    import platform
+    import shutil
+
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    if sys.platform != "darwin":
+        problems.append(f"macOS required (this is {sys.platform}); "
+                        "the MLX runtime only exists for Apple platforms")
+    if platform.machine() != "arm64":
+        problems.append(f"Apple Silicon (arm64) required, found {platform.machine()}; "
+                        "MLX does not support Intel Macs")
+    if not shutil.which("afconvert"):
+        problems.append("afconvert not found (ships with macOS; needed for M4A output)")
+
+    ram_gb = None
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True, timeout=5)
+        ram_gb = int(out.stdout.strip()) / 2**30
+        if ram_gb < 8:
+            problems.append(f"{ram_gb:.0f} GB RAM is not enough (the model needs "
+                            "~4 GB resident; 8 GB minimum, 16 GB recommended)")
+        elif ram_gb < 16:
+            warnings.append(f"{ram_gb:.0f} GB RAM: works, but expect memory pressure "
+                            "alongside other apps (16 GB recommended)")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        warnings.append("could not determine RAM size")
+
+    if problems:
+        payload = {"ok": False, "problems": problems, "warnings": warnings}
+        if args.json:
+            print(json.dumps(payload))
+        for p in problems:
+            log_err(f"tts: incompatible: {p}")
+        return EXIT_UNAVAILABLE
+
+    # Heavy imports only past the cheap checks.
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    from tts_local.core import MODEL_ID, download_model, model_cached
+
+    cache_root = Path(HF_HUB_CACHE)
+    probe_dir = cache_root
+    while not probe_dir.exists():
+        probe_dir = probe_dir.parent
+    free_gb = shutil.disk_usage(probe_dir).free / 2**30
+
+    present = model_cached()
+    downloaded_now = False
+    if not present:
+        if free_gb < 5:
+            msg = (f"only {free_gb:.1f} GB free at {cache_root}; "
+                   "the model needs ~3.5 GB (5 GB to be safe)")
+            if args.json:
+                print(json.dumps({"ok": False, "problems": [msg], "warnings": warnings}))
+            log_err(f"tts: {msg}")
+            return EXIT_UNAVAILABLE
+        log_err(f"downloading {MODEL_ID} (~3.5 GB, one-time) ...")
+        try:
+            download_model()
+        except Exception as exc:
+            msg = f"model download failed: {exc}"
+            if args.json:
+                print(json.dumps({"ok": False, "problems": [msg], "warnings": warnings}))
+            log_err(f"tts: {msg}")
+            return EXIT_UNAVAILABLE
+        downloaded_now = True
+
+    # A daemon that started before the model existed is wedged in "failed";
+    # stop it so the next call starts fresh against the now-present model.
+    stopped_failed = False
+    d = read_discovery()
+    if d:
+        try:
+            health = request(d, "GET", "/v1/health", timeout=3, auth=False)
+            if health.get("status") == "failed" and health.get("pid") == d.get("pid"):
+                request(d, "POST", "/v1/shutdown")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and pid_alive(d["pid"]):
+                    time.sleep(0.3)
+                stopped_failed = not pid_alive(d["pid"])
+                log_err("stopped a previously-failed daemon; the next call starts fresh"
+                        if stopped_failed else
+                        f"warning: failed daemon (pid {d['pid']}) has not exited yet")
+        except Exception:
+            pass
+
+    for w in warnings:
+        log_err(f"tts: note: {w}")
+    emit(args, {"ok": True, "model_id": MODEL_ID, "model_downloaded": True,
+                "downloaded_now": downloaded_now, "stopped_failed_daemon": stopped_failed,
+                "ram_gb": round(ram_gb) if ram_gb else None, "warnings": warnings},
+         human=("model downloaded — ready to use: try  tts speak \"hello\" -o hello.m4a"
+                if downloaded_now else "already set up — nothing to do"))
+    return EXIT_OK
+
+
 def cmd_daemon_logs(args) -> int:
     if not LOG_PATH.exists():
         log_err(f"no log file at {LOG_PATH}")
@@ -428,8 +545,11 @@ def add_input_opts(p: argparse.ArgumentParser) -> None:
 
 def add_daemon_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-start", action="store_true", help="fail if daemon is not running")
-    p.add_argument("--start-timeout", type=float, default=180,
-                   help="seconds to wait for daemon readiness (default 180)")
+    p.add_argument("--start-timeout", type=float, default=None,
+                   help="seconds to wait for daemon readiness "
+                        "(default 180, or 1800 with --auto-download)")
+    p.add_argument("--auto-download", action="store_true",
+                   help="allow the daemon to download the model (~3.5 GB) if missing")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -474,6 +594,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_cancel)
 
+    p = sub.add_parser("setup", help="check machine compatibility and download "
+                                     "the model (idempotent)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_setup)
+
     p = sub.add_parser("health", help="daemon health")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_health)
@@ -487,7 +612,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = dsub.add_parser("start", help="start the daemon and wait until ready")
     p.add_argument("--foreground", action="store_true", help="run in the foreground")
-    p.add_argument("--start-timeout", type=float, default=180)
+    p.add_argument("--start-timeout", type=float, default=None)
+    p.add_argument("--auto-download", action="store_true",
+                   help="allow the daemon to download the model (~3.5 GB) if missing")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_daemon_start)
 

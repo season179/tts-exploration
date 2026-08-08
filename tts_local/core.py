@@ -15,6 +15,9 @@ import re
 log = logging.getLogger("tts_core")
 
 MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
+# Pinned so upstream pushes can't trigger surprise multi-GB redownloads or
+# silently change model behavior.
+MODEL_REVISION = "52f4770fd9726457eae3d3b6aa92047a25a10776"
 SAMPLE_RATE = 24000
 MAX_TEXT_CHARS = 10_000
 MAX_INSTRUCTION_CHARS = 500
@@ -110,6 +113,31 @@ def chunk_text(text: str) -> list[list[str]]:
     return result
 
 
+def cached_model_path() -> str | None:
+    """Local snapshot path if the pinned model revision is fully cached, else None.
+
+    Any cache problem (missing, corrupt, permissions) reports as "not cached";
+    `tts setup` re-verifies and repairs via download_model().
+    """
+    from huggingface_hub import snapshot_download
+
+    try:
+        return snapshot_download(MODEL_ID, revision=MODEL_REVISION, local_files_only=True)
+    except Exception:
+        return None
+
+
+def model_cached() -> bool:
+    return cached_model_path() is not None
+
+
+def download_model() -> str:
+    """Fetch (or verify) the pinned model revision; returns its snapshot path."""
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(MODEL_ID, revision=MODEL_REVISION)
+
+
 class Engine:
     """Owns the loaded model. Not thread-safe: call synthesize() from one worker."""
 
@@ -120,7 +148,10 @@ class Engine:
     def load(self) -> None:
         from mlx_audio.tts.utils import load
 
-        model = load(self.model_id)
+        # Always load from a local snapshot of the pinned revision: cached, or
+        # downloaded first (only reached with TTS_AUTO_DOWNLOAD — the daemon
+        # gates on model_cached() otherwise).
+        model = load(cached_model_path() or download_model())
         if model.sample_rate != SAMPLE_RATE:
             raise RuntimeError(
                 f"expected native {SAMPLE_RATE} Hz output, model reports {model.sample_rate} Hz"

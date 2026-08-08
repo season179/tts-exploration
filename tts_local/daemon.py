@@ -8,7 +8,7 @@ Resident inference server for the `tts` CLI, other applications, and agents:
   TTL cleanup of finished jobs and audio files
 - Also serves the browser UI at /
 
-Run directly (foreground): .venv/bin/python tts_daemon.py
+Run directly (foreground): python -m tts_local.daemon
 Normally started via: tts daemon start
 """
 
@@ -28,10 +28,11 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import resources
 from pathlib import Path
 
-import tts_core
-from tts_core import (
+from tts_local import core as tts_core
+from tts_local.core import (
     FORMATS,
     MAX_INSTRUCTION_CHARS,
     MAX_TEXT_CHARS,
@@ -42,8 +43,9 @@ from tts_core import (
     JobCancelled,
 )
 
+from tts_local import __version__ as DAEMON_VERSION
+
 PROTOCOL_VERSION = 1
-DAEMON_VERSION = "0.1.0"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 QUEUE_CAPACITY = 16
@@ -59,8 +61,7 @@ DISCOVERY_PATH = STATE_DIR / "daemon.json"
 LOCK_PATH = STATE_DIR / "daemon.lock"
 LOG_PATH = STATE_DIR / "daemon.log"
 
-APP_DIR = Path(__file__).resolve().parent
-INDEX_HTML = APP_DIR / "index.html"
+INDEX_HTML = resources.files("tts_local").joinpath("index.html")
 
 CONTENT_TYPES = {"m4a": "audio/mp4", "wav": "audio/wav"}
 CSP = (
@@ -137,6 +138,16 @@ def remove_discovery() -> None:
 
 
 def load_model() -> None:
+    # Never silently pull 3.5 GB: require the model to be pre-downloaded
+    # (tts setup) unless the caller explicitly opted in.
+    if os.environ.get("TTS_AUTO_DOWNLOAD") != "1" and not tts_core.model_cached():
+        model_state["status"] = "failed"
+        model_state["error"] = (
+            "model not downloaded; run `tts setup` once (~3.5 GB download), "
+            "or set TTS_AUTO_DOWNLOAD=1"
+        )
+        log.error(model_state["error"])
+        return
     log.info("loading %s ...", MODEL_ID)
     t0 = time.time()
     try:
