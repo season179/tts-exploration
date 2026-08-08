@@ -4,12 +4,15 @@ Pure inference layer: model loading, text chunking, synthesis, and audio
 encoding. No HTTP or job-queue concerns.
 """
 
+import logging
 import subprocess
 import wave
 from pathlib import Path
 
 import numpy as np
 import re
+
+log = logging.getLogger("tts_core")
 
 MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
 SAMPLE_RATE = 24000
@@ -20,6 +23,15 @@ CHUNK_MAX = 400  # hard maximum chunk length
 PARAGRAPH_PAUSE_MS = 250
 CHUNK_PAUSE_MS = 80
 M4A_BITRATE = 64000  # AAC, plenty for 24 kHz mono speech
+
+# Runaway-generation guard. The model sometimes fails to emit end-of-speech
+# (seen with style instructions on short text) and runs to its 4096-token
+# (~328s) ceiling. Cap each chunk's audio at a generous multiple of its text
+# length so a runaway wastes seconds, not minutes. Normal speech stays far
+# below 0.6 s/char (slow Chinese ~0.5, English ~0.1).
+CODEC_TOKENS_PER_SEC = 12.5  # 4096 tokens == 327.68 s
+CAP_SEC_PER_CHAR = 0.6
+CAP_SEC_FLOOR = 10.0
 
 VOICES = {"english": "Aiden", "chinese": "Serena"}
 FORMATS = ("m4a", "wav")
@@ -155,17 +167,25 @@ class Engine:
                     raise JobCancelled()
                 if c_idx > 0:
                     segments.append(chunk_pause)
+                cap_sec = max(CAP_SEC_FLOOR, len(chunk) * CAP_SEC_PER_CHAR)
                 audio_parts = []
                 for r in self.model.generate_custom_voice(
                     text=chunk,
                     speaker=speaker,
                     language=language,
                     instruct=instruction or None,
+                    max_tokens=int(cap_sec * CODEC_TOKENS_PER_SEC),
                 ):
                     if cancel and cancel():
                         raise JobCancelled()
                     audio_parts.append(np.asarray(r.audio, dtype=np.float32))
-                segments.append(np.concatenate(audio_parts))
+                chunk_audio = np.concatenate(audio_parts)
+                if len(chunk_audio) >= (cap_sec - 1.0) * SAMPLE_RATE:
+                    log.warning(
+                        "runaway generation capped at %.1fs for %d-char chunk %r",
+                        len(chunk_audio) / SAMPLE_RATE, len(chunk), chunk[:40],
+                    )
+                segments.append(chunk_audio)
                 done += 1
                 if progress:
                     progress(done, total, meta)
