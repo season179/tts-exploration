@@ -43,7 +43,17 @@ CAP_SEC_FLOOR = 10.0
 # a 3x amplitude margin below real speech.
 SILENCE_RMS = 1e-2
 
-VOICES = {"english": "Aiden", "chinese": "Serena"}
+VOICES = {
+    "Ryan": {"language": "english"},
+    "Aiden": {"language": "english"},
+    "Vivian": {"language": "chinese"},
+    "Serena": {"language": "chinese"},
+    "Uncle_Fu": {"language": "chinese"},
+    "Dylan": {"language": "chinese", "note": "Beijing dialect"},
+    "Eric": {"language": "chinese", "note": "Sichuan dialect"},
+}
+DEFAULT_VOICES = {"english": "Ryan", "chinese": "Serena"}
+LANGUAGES = tuple(DEFAULT_VOICES)
 FORMATS = ("m4a", "wav")
 
 # CJK punctuation, unified ideographs (+ext A), compatibility ideographs,
@@ -57,6 +67,22 @@ SENTENCE_RE = re.compile(r"[^.!?。！？；;…\n]*[.!?。！？；;…]+[\"'�
 
 class JobCancelled(Exception):
     """Raised inside synthesize() when the cancel callback returns True."""
+
+
+def valid_voices_text() -> str:
+    """Human-readable speaker catalogue for validation errors."""
+    return ", ".join(
+        f"{name} ({metadata['language']})" for name, metadata in VOICES.items()
+    )
+
+
+def validate_voice(voice: str | None) -> None:
+    """Raise a teaching error unless voice is omitted or names a model speaker."""
+    if voice is not None and (not isinstance(voice, str) or voice not in VOICES):
+        raise ValueError(
+            f"unknown voice {voice!r}. Valid voices: {valid_voices_text()}. "
+            "Voices may be used with either language; run `tts voices` for details."
+        )
 
 
 def detect_language(text: str) -> str:
@@ -172,6 +198,7 @@ class Engine:
         instruction: str = "",
         cancel=None,
         progress=None,
+        voice: str | None = None,
     ) -> tuple[np.ndarray, dict]:
         """Synthesize text to float32 mono audio at SAMPLE_RATE.
 
@@ -182,9 +209,10 @@ class Engine:
         if self.model is None:
             raise RuntimeError("model not loaded")
 
+        validate_voice(voice)
         if language == "auto":
             language = detect_language(text)
-        speaker = VOICES[language]
+        speaker = voice or DEFAULT_VOICES[language]
 
         paragraphs = chunk_text(text)
         total = sum(len(p) for p in paragraphs)

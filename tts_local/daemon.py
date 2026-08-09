@@ -34,7 +34,9 @@ from pathlib import Path
 from tts_local import core as tts_core
 from tts_local.core import (
     CJK_RE,
+    DEFAULT_VOICES,
     FORMATS,
+    LANGUAGES,
     MAX_INSTRUCTION_CHARS,
     MAX_INSTRUCTION_WORDS,
     MAX_TEXT_CHARS,
@@ -43,6 +45,7 @@ from tts_local.core import (
     VOICES,
     Engine,
     JobCancelled,
+    validate_voice,
 )
 
 from tts_local import __version__ as DAEMON_VERSION
@@ -188,6 +191,7 @@ def synthesize_job(job_id: str) -> None:
         job["text"],
         language=job["language"],
         instruction=job["instruction"],
+        voice=job["voice"],
         cancel=cancel_event.is_set,
         progress=on_progress,
     )
@@ -379,9 +383,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/voices":
             self._send_json({
                 "voices": [
-                    {"name": name, "language": lang} for lang, name in VOICES.items()
+                    {
+                        "name": name,
+                        **metadata,
+                        "default": DEFAULT_VOICES.get(metadata["language"]) == name,
+                    }
+                    for name, metadata in VOICES.items()
                 ],
-                "languages": ["auto", *VOICES],
+                "defaults": DEFAULT_VOICES,
+                "languages": ["auto", *LANGUAGES],
                 "formats": list(FORMATS),
                 "default_format": "m4a",
                 "max_text_chars": MAX_TEXT_CHARS,
@@ -450,6 +460,7 @@ class Handler(BaseHTTPRequestHandler):
 
         text = payload.get("text")
         language = payload.get("language", "auto")
+        voice = payload.get("voice")
         # No default instruction: style instructions can trigger runaway
         # generation (model runs to its length cap) on short/Chinese text.
         instruction = payload.get("instruction", "")
@@ -461,8 +472,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(text) > MAX_TEXT_CHARS:
             self._fail(400, "invalid_request", f"text exceeds {MAX_TEXT_CHARS} character cap")
             return
-        if not isinstance(language, str) or language.strip().lower() not in ("auto", *VOICES):
+        if not isinstance(language, str) or language.strip().lower() not in ("auto", *LANGUAGES):
             self._fail(400, "invalid_request", "language must be auto, english, or chinese")
+            return
+        try:
+            validate_voice(voice)
+        except ValueError as exc:
+            self._fail(400, "invalid_request", str(exc))
             return
         if not isinstance(instruction, str) or len(instruction) > MAX_INSTRUCTION_CHARS:
             self._fail(
@@ -501,6 +517,7 @@ class Handler(BaseHTTPRequestHandler):
             "status": "queued",
             "text": text,
             "language": language.strip().lower(),
+            "voice": voice,
             "instruction": instruction,
             "format": fmt,
             "chunks_done": 0,
@@ -520,8 +537,8 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(429, "busy", "job queue is full, retry later", retryable=True)
             return
         work_queue.put(job_id)
-        log.info("job %s: queued (%d chars, language=%s, format=%s)",
-                 job_id[:8], len(text), job["language"], fmt)
+        log.info("job %s: queued (%d chars, language=%s, voice=%s, format=%s)",
+                 job_id[:8], len(text), job["language"], voice or "default", fmt)
         self._send_json({"id": job_id, "status": "queued"}, 202)
 
     def do_DELETE(self):

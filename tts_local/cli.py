@@ -274,6 +274,8 @@ def finish_job(args, d: dict, job: dict, dest: str | None) -> int:
 def submit_job(args, d: dict) -> dict:
     text = read_text_input(args)
     body = {"text": text, "language": args.language, "format": args.format}
+    if args.voice is not None:
+        body["voice"] = args.voice
     if args.instruction is not None:
         body["instruction"] = args.instruction
     return request(d, "POST", "/v1/jobs", body=body)
@@ -355,8 +357,16 @@ def cmd_health(args) -> int:
 def cmd_voices(args) -> int:
     d, _ = connect(no_start=True, need_ready=False)
     info = request(d, "GET", "/v1/voices")
-    emit(args, {"ok": True, **info},
-         human="\n".join(f"{v['name']}\t{v['language']}" for v in info["voices"]))
+    emit(
+        args,
+        {"ok": True, **info},
+        human="\n".join(
+            f"{v['name']}\t{v['language']}"
+            + (f" ({v['note']})" if v.get("note") else "")
+            + (" [default]" if v.get("default") else "")
+            for v in info["voices"]
+        ),
+    )
     return EXIT_OK
 
 
@@ -525,9 +535,11 @@ def cmd_setup(args) -> int:
 AGENTS_DOC = """\
 # tts — local text-to-speech CLI (for scripts and AI agents)
 
-Offline Qwen3-TTS on Apple Silicon. Two voices: Aiden (English), Serena
-(Chinese); language is auto-detected. Output: M4A (default) or WAV
-(24 kHz mono). A resident daemon holds the model; the CLI auto-starts it
+Offline Qwen3-TTS on Apple Silicon. Seven voices: Ryan and Aiden (English);
+Vivian, Serena, Uncle_Fu, Dylan (Beijing dialect), and Eric (Sichuan dialect)
+(Chinese). Language is auto-detected; defaults are Ryan for English and Serena
+for Chinese. Output: M4A (default) or WAV (24 kHz mono). Any voice can speak
+either language. A resident daemon holds the model; the CLI auto-starts it
 (first start ~1 min to load the model, later calls take seconds).
 
 ## Synchronous (most common)
@@ -536,7 +548,8 @@ Offline Qwen3-TTS on Apple Silicon. Two voices: Aiden (English), Serena
     echo "text" | tts speak -o out.m4a --json      # stdin
     tts speak "text" -o - > out.m4a                # binary audio to stdout
 
-Options: --instruction "Calm, warm narration." — max 18 words (36 chars Chinese),
+Options: --voice NAME (see `tts voices`; omit for the language default),
+--instruction "Calm, warm narration." — max 18 words (36 chars Chinese),
 --language auto|english|chinese, --format m4a|wav, --timeout SECONDS,
 --force (overwrite), --quiet, --no-start (fail instead of starting daemon).
 Max 10,000 chars per request; long text is chunked automatically.
@@ -600,6 +613,9 @@ def add_input_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stdin", action="store_true", help="force reading text from stdin")
     p.add_argument("--language", default="auto", choices=["auto", "english", "chinese"])
     p.add_argument(
+        "--voice", help="speaker name (default: Ryan for English, Serena for Chinese)"
+    )
+    p.add_argument(
         "--instruction", help="short style cue; max 18 words (36 chars Chinese)"
     )
     p.add_argument("--format", default="m4a", choices=["m4a", "wav"],
@@ -620,13 +636,14 @@ examples:
   tts speak "hello there" -o hello.m4a
   echo "piped text" | tts speak -o out.m4a
   tts speak "Once upon a time, a little fox lost his way." \\
-      --instruction "Warm, gentle bedtime-story narration." -o story.m4a
+      --voice Aiden --instruction "Warm, gentle bedtime-story narration." -o story.m4a
   tts speak "你好，很高兴认识你。" --format wav -o zh.wav
   tts speak "hi" --json                      # machine-readable result
   id=$(tts submit "long text ..."); tts wait "$id" -o long.m4a
   tts daemon status                          # daemon state + web UI URL
 
 speak/submit options (see `tts speak --help` for all):
+  --voice NAME         speaker; defaults: English Ryan, Chinese Serena
   --instruction TEXT   short style cue; max 18 words (36 chars Chinese)
   --language X         auto | english | chinese        --format X   m4a | wav
 
@@ -694,7 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_health)
 
-    p = sub.add_parser("voices", help="list voices, languages, formats")
+    p = sub.add_parser("voices", help="list all voices, language affinities, and defaults")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_voices)
 

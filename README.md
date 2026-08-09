@@ -2,7 +2,9 @@
 
 Local-only text-to-speech for Apple Silicon, callable by other applications
 and AI agents. Uses `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16` via
-`mlx-audio`. Voices: **Aiden** (English), **Serena** (Chinese).
+`mlx-audio`. It includes seven built-in voices and allows any voice to speak
+either supported language. English defaults to **Ryan**; Chinese defaults to
+**Serena**.
 
 One installable package (`tts_local/`), three parts:
 
@@ -36,10 +38,10 @@ uv run tts daemon start --foreground   # or run the daemon in this terminal
 ## CLI usage
 
 ```bash
-tts speak "Hello there" -o hello.m4a          # auto-starts the daemon
-echo "Hello" | tts speak -o hello.m4a         # stdin works too
-tts speak "你好" --format wav -o hello.wav    # WAV instead of M4A
-tts speak "Hi" --json                         # machine-readable result
+tts speak "Hello there" -o hello.m4a                  # English defaults to Ryan
+echo "Hello" | tts speak --voice Aiden -o hello.m4a  # choose a voice
+tts speak "你好" --format wav -o hello.wav            # Chinese defaults to Serena
+tts speak "Hi" --json                                 # machine-readable result
 ```
 
 Default output format is **M4A** (AAC 64 kbps, encoded with macOS's built-in
@@ -63,11 +65,29 @@ tts health --json
 tts voices --json
 ```
 
-Useful flags: `--language auto|english|chinese`, `--instruction "Calm, warm
-narration."` (max 18 words; 36 chars Chinese), `-o -` (binary audio to
-stdout), `--no-start`, `--timeout`, `--force`, `--quiet`. Keep instructions to
-emotion + pace + 1–2 vocal qualities, phrased as an imperative or compact
-descriptor.
+Useful flags: `--voice NAME`, `--language auto|english|chinese`,
+`--instruction "Calm, warm narration."` (max 18 words; 36 chars Chinese),
+`-o -` (binary audio to stdout), `--no-start`, `--timeout`, `--force`,
+`--quiet`. Keep instructions to emotion + pace + 1–2 vocal qualities, phrased
+as an imperative or compact descriptor.
+
+## Voices
+
+| Voice | Language affinity | Default |
+| --- | --- | --- |
+| Ryan | English | English default |
+| Aiden | English | |
+| Vivian | Chinese | |
+| Serena | Chinese | Chinese default |
+| Uncle_Fu | Chinese | |
+| Dylan | Chinese (Beijing dialect) | |
+| Eric | Chinese (Sichuan dialect) | |
+
+The affinity describes the voice's native language, not a restriction. Any
+voice can be used with English or Chinese text, for example
+`tts speak "Hello" --voice Vivian`. With `--language auto` (the default), text
+language is detected first and selects Ryan for English or Serena for Chinese
+unless `--voice` is supplied. Run `tts voices` for the catalogue and defaults.
 
 Exit codes: `0` ok · `2` usage · `3` daemon unavailable · `4` timeout ·
 `5` busy · `6` synthesis failed/canceled · `7` output I/O · `130` interrupted.
@@ -93,7 +113,7 @@ All endpoints except `/v1/health` require `Authorization: Bearer <token>`.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /v1/health` | `loading` / `ready` / `failed`, queue depth (no auth) |
-| `POST /v1/jobs` | `{text, language?, instruction?, format?}` → `202 {id}` |
+| `POST /v1/jobs` | `{text, language?, voice?, instruction?, format?}` → `202 {id}` |
 | `GET /v1/jobs/{id}` | status, progress, and `audio_url` when done |
 | `DELETE /v1/jobs/{id}` | cancel (queued instantly; running between chunks) |
 | `GET /v1/jobs/{id}/audio` | the audio file (`audio/mp4` or `audio/wav`) |
@@ -107,7 +127,9 @@ and their audio expire after 1 hour. Jobs do not survive a daemon restart.
 ## Behavior notes
 
 - Text is split into paragraphs (blank lines) and sentence chunks of ~300–400
-  chars; language `auto` picks Serena when the text is ≥30% CJK, else Aiden.
+  chars; language `auto` selects the Chinese default Serena when the text is
+  ≥30% CJK, else the English default Ryan. An explicit voice overrides that
+  voice choice without changing the detected text language.
 - No style instruction is applied by default. Instructions are capped at 18
   words (36 chars Chinese) because long prose destabilizes generation. On
   short or Chinese text they can still trigger runaway generation (the model
