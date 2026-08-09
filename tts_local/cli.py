@@ -536,7 +536,7 @@ Offline Qwen3-TTS on Apple Silicon. Two voices: Aiden (English), Serena
     echo "text" | tts speak -o out.m4a --json      # stdin
     tts speak "text" -o - > out.m4a                # binary audio to stdout
 
-Options: --instruction "Whisper urgently." (narration style, max 500 chars),
+Options: --instruction "Calm, warm narration." — max 18 words (36 chars Chinese),
 --language auto|english|chinese, --format m4a|wav, --timeout SECONDS,
 --force (overwrite), --quiet, --no-start (fail instead of starting daemon).
 Max 10,000 chars per request; long text is chunked automatically.
@@ -568,6 +568,9 @@ Max 10,000 chars per request; long text is chunked automatically.
 
 ## Caveats
 
+- Keep --instruction short: emotion + pace + 1-2 vocal qualities, as an
+  imperative or compact descriptor. Examples: "Calm, warm narration." or
+  "Speak in a frightened, trembling tone, voice shaky."
 - A style --instruction on very short text can rarely produce overlong
   audio; a built-in guard caps it (~0.6 s/char, min 10 s).
 - One instruction applies to the whole request; split text needing
@@ -596,7 +599,9 @@ def add_input_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("text", nargs="?", help="text to speak (default: read stdin)")
     p.add_argument("--stdin", action="store_true", help="force reading text from stdin")
     p.add_argument("--language", default="auto", choices=["auto", "english", "chinese"])
-    p.add_argument("--instruction", help="narration style instruction")
+    p.add_argument(
+        "--instruction", help="short style cue; max 18 words (36 chars Chinese)"
+    )
     p.add_argument("--format", default="m4a", choices=["m4a", "wav"],
                    help="audio format (default m4a)")
 
@@ -622,7 +627,7 @@ examples:
   tts daemon status                          # daemon state + web UI URL
 
 speak/submit options (see `tts speak --help` for all):
-  --instruction TEXT   narration style, e.g. "Whisper urgently." (max 500 chars)
+  --instruction TEXT   short style cue; max 18 words (36 chars Chinese)
   --language X         auto | english | chinese        --format X   m4a | wav
 
 for scripts and agents:

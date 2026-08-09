@@ -33,8 +33,10 @@ from pathlib import Path
 
 from tts_local import core as tts_core
 from tts_local.core import (
+    CJK_RE,
     FORMATS,
     MAX_INSTRUCTION_CHARS,
+    MAX_INSTRUCTION_WORDS,
     MAX_TEXT_CHARS,
     MODEL_ID,
     SAMPLE_RATE,
@@ -468,6 +470,27 @@ class Handler(BaseHTTPRequestHandler):
                 f"instruction must be a string of at most {MAX_INSTRUCTION_CHARS} chars",
             )
             return
+        instruction = instruction.strip()
+        contains_cjk = CJK_RE.search(instruction) is not None
+        if contains_cjk:
+            if len(instruction) > 36:
+                self._fail(
+                    400, "invalid_request",
+                    f"instruction too long ({len(instruction)} chars, max 36 for Chinese). "
+                    "This model follows short style cues best — emotion, pace, one or two "
+                    "vocal qualities.",
+                )
+                return
+        else:
+            word_count = len(instruction.split())
+            if word_count > MAX_INSTRUCTION_WORDS:
+                self._fail(
+                    400, "invalid_request",
+                    f"instruction too long ({word_count} words, max {MAX_INSTRUCTION_WORDS}). "
+                    "This model follows short style cues best — emotion, pace, one or two "
+                    'vocal qualities. Example: "Speak in a sad, low tone, voice heavy and slow."',
+                )
+                return
         if fmt not in FORMATS:
             self._fail(400, "invalid_request", f"format must be one of {', '.join(FORMATS)}")
             return
@@ -478,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
             "status": "queued",
             "text": text,
             "language": language.strip().lower(),
-            "instruction": instruction.strip(),
+            "instruction": instruction,
             "format": fmt,
             "chunks_done": 0,
             "created_at": time.time(),

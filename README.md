@@ -63,9 +63,11 @@ tts health --json
 tts voices --json
 ```
 
-Useful flags: `--language auto|english|chinese`, `--instruction "Speak
-slowly."`, `-o -` (binary audio to stdout), `--no-start`, `--timeout`,
-`--force`, `--quiet`.
+Useful flags: `--language auto|english|chinese`, `--instruction "Calm, warm
+narration."` (max 18 words; 36 chars Chinese), `-o -` (binary audio to
+stdout), `--no-start`, `--timeout`, `--force`, `--quiet`. Keep instructions to
+emotion + pace + 1–2 vocal qualities, phrased as an imperative or compact
+descriptor.
 
 Exit codes: `0` ok · `2` usage · `3` daemon unavailable · `4` timeout ·
 `5` busy · `6` synthesis failed/canceled · `7` output I/O · `130` interrupted.
@@ -106,9 +108,10 @@ and their audio expire after 1 hour. Jobs do not survive a daemon restart.
 
 - Text is split into paragraphs (blank lines) and sentence chunks of ~300–400
   chars; language `auto` picks Serena when the text is ≥30% CJK, else Aiden.
-- No style instruction is applied by default. Instructions are a known model
-  quirk: on short or Chinese text they can trigger runaway generation (the
-  model fails to stop speaking). A per-chunk guard caps the damage at
+- No style instruction is applied by default. Instructions are capped at 18
+  words (36 chars Chinese) because long prose destabilizes generation. On
+  short or Chinese text they can still trigger runaway generation (the model
+  fails to stop speaking). A per-chunk guard caps the damage at
   0.6 s per character (10 s minimum) and logs a warning when it fires, so a
   runaway costs seconds, not minutes.
 - One job synthesizes at a time (single MLX worker); others queue.
